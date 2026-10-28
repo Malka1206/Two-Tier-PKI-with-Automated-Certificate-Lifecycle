@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pki:
+    runs-on: ubuntu-latest
+    env:
+      # Throwaway passphrase: the PKI is built from scratch on the runner and
+      # discarded when the job ends. No key is ever stored in the repository.
+      PKI_ROOT_PASS: ci-throwaway-passphrase
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install OpenSSL, Nginx and dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssl nginx shellcheck curl make
+          openssl version
+          nginx -v
+          shellcheck --version
+
+      - name: Lint all scripts with shellcheck
+        run: shellcheck pki-tool tests/*.sh
+
+      - name: Build a fresh PKI from scratch
+        run: make init
+
+      - name: Run the full test suite
+        run: make test

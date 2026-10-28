@@ -45,14 +45,13 @@ expect_verify_fail() {
     ok "$desc"
   else
     ko "$desc (failed, but not for the expected reason '$pattern')"
-    sed 's/^/        /' <<< "$out"
+    printf '        %s\n' "${out//$'\n'/$'\n        '}"
   fi
 }
 
 # --- Helpers -------------------------------------------------------------------
 wait_port() {
-  local i
-  for i in $(seq 1 50); do
+  for _ in $(seq 1 50); do
     if (exec 3<>/dev/tcp/127.0.0.1/"$1") 2>/dev/null; then return 0; fi
     sleep 0.2
   done
@@ -60,8 +59,7 @@ wait_port() {
 }
 
 wait_port_closed() {
-  local i
-  for i in $(seq 1 50); do
+  for _ in $(seq 1 50); do
     if ! (exec 3<>/dev/tcp/127.0.0.1/"$1") 2>/dev/null; then return 0; fi
     sleep 0.2
   done

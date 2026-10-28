@@ -8,7 +8,7 @@ export MSYS2_ARG_CONV_EXCL="${MSYS2_ARG_CONV_EXCL:+$MSYS2_ARG_CONV_EXCL;}/O="
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NGINX="${NGINX:-nginx}"
 NGX_PORT="${TEST_NGINX_PORT:-18443}"     # different from `make up` (8443)
-OCSP_PORT="${TEST_OCSP_PORT:-12560}"     # different from `make up` (2560)
+export OCSP_PORT="${TEST_OCSP_PORT:-12560}"     # different from `make up` (2560)
 
 PASS=0
 FAIL=0
@@ -45,14 +45,13 @@ expect_verify_fail() {
     ok "$desc"
   else
     ko "$desc (failed, but not for the expected reason '$pattern')"
-    sed 's/^/        /' <<< "$out"
+    printf '        %s\n' "${out//$'\n'/$'\n        '}"
   fi
 }
 
 # --- Helpers -------------------------------------------------------------------
 wait_port() {
-  local i
-  for i in $(seq 1 50); do
+  for _ in $(seq 1 50); do
     if (exec 3<>/dev/tcp/127.0.0.1/"$1") 2>/dev/null; then return 0; fi
     sleep 0.2
   done
@@ -60,8 +59,7 @@ wait_port() {
 }
 
 wait_port_closed() {
-  local i
-  for i in $(seq 1 50); do
+  for _ in $(seq 1 50); do
     if ! (exec 3<>/dev/tcp/127.0.0.1/"$1") 2>/dev/null; then return 0; fi
     sleep 0.2
   done
