@@ -1,5 +1,5 @@
 # =============================================================================
-# Two-Tier PKI - Makefile (README section 9)
+# Two-Tier PKI - Makefile 
 #
 #   make init                 build the whole PKI (root, intermediate, OCSP cert,
 #                             server cert, client cert "alice", CRLs)
@@ -8,8 +8,6 @@
 #   make revoke CN=<name>     revoke a certificate and regenerate the CRL
 #   make clean                delete all generated PKI material
 #
-# The root key passphrase must be provided through the environment
-# (PKI_ROOT_PASS or PKI_ROOT_PASS_FILE), see pki-tool.
 # =============================================================================
 
 SHELL    := bash
@@ -22,12 +20,10 @@ TOOL     := bash ./pki-tool --pki-dir $(PKI_DIR)
 RUN_DIR  := $(PKI_DIR)/run
 NGX_DIR  := $(PKI_DIR)/nginx
 
-# True when something accepts connections on the Nginx port. Used instead of
-# `kill -0` on the Nginx pid file, because under Git Bash the pid written by the
-# native Windows nginx.exe is not a process that `kill` can see.
+# True when something accepts connections on the Nginx port. 
 NGX_UP    = (exec 3<>/dev/tcp/127.0.0.1/8443) 2>/dev/null
 
-# Absolute path of the Nginx prefix (native Windows form under Git Bash).
+# Absolute path of the Nginx prefix .
 NGX_ABS   = $$(cd $(NGX_DIR) && { pwd -W 2>/dev/null || pwd; })
 
 .PHONY: init up down test revoke clean nginx-prepare
@@ -41,7 +37,6 @@ init:
 	@$(TOOL) gen-crl
 	@$(TOOL) gen-crl --root
 
-# Copies the PKI files Nginx needs and generates its runtime configuration.
 nginx-prepare:
 	@test -f $(PKI_DIR)/servers/web.lab.local.crt || { echo "PKI not initialised: run 'make init' first"; exit 1; }
 	@mkdir -p $(NGX_DIR)/certs $(NGX_DIR)/logs $(NGX_DIR)/temp
@@ -84,7 +79,7 @@ down:
 test:
 	@bash tests/run-all.sh
 
-# make revoke CN=alice [REASON=keyCompromise]
+
 revoke:
 	@test -n "$(CN)" || { echo "usage: make revoke CN=<name> [REASON=<reason>]"; exit 1; }
 	@cert=""; \

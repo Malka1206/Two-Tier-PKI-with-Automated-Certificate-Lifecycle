@@ -1,10 +1,5 @@
 # =============================================================================
-# Nginx mutual-TLS service (README section 6)
-#
-# The certificate paths below (/etc/nginx/certs) are the ones given in the
-# README. `make up` copies the PKI files to pki/nginx/certs and rewrites this
-# prefix to that directory before starting Nginx.
-# The relative paths (logs/...) are relative to the Nginx prefix (-p).
+# Nginx mutual-TLS service 
 # =============================================================================
 worker_processes  1;
 pid               logs/nginx.pid;
