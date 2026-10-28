@@ -1,0 +1,110 @@
+# =============================================================================
+# Intermediate CA configuration 
+#
+# The intermediate issues server, client, code-signing and OCSP-signing
+# certificates, and publishes the intermediate CRL.
+#
+# Layout used by this file:
+#   $PKI_DIR/intermediate/
+#       private/intermediate.key   intermediate key
+#       intermediate.crt           intermediate certificate (signed by root)
+#       index.txt                  CA database 
+#       crlnumber                  CRL counter
+#       newcerts/                  copies of issued certificates
+#       crl/intermediate.crl       intermediate CRL
+#
+# =============================================================================
+
+[ ca ]
+default_ca = CA_intermediate
+
+[ CA_intermediate ]
+dir               = $ENV::PKI_DIR/intermediate
+private_key       = $dir/private/intermediate.key
+certificate       = $dir/intermediate.crt
+new_certs_dir     = $dir/newcerts
+database          = $dir/index.txt
+serial            = $dir/serial   # required by openssl ca; unused because -rand_serial is passed
+crlnumber         = $dir/crlnumber
+crl               = $dir/crl/intermediate.crl
+crl_extensions    = crl_ext
+default_md        = sha384
+default_days      = 90            
+default_crl_days  = 7             
+policy            = policy_loose
+unique_subject    = no            # allows renewal with the same subject
+preserve          = no
+copy_extensions   = copy
+name_opt          = ca_default
+cert_opt          = ca_default
+
+[ policy_loose ]
+countryName             = optional
+stateOrProvinceName     = optional
+localityName            = optional
+organizationName        = optional
+organizationalUnitName  = optional
+commonName              = supplied
+emailAddress            = optional
+
+# -----------------------------------------------------------------------------
+# Certificate request 
+# -----------------------------------------------------------------------------
+[ req ]
+distinguished_name  = req_distinguished_name
+string_mask         = utf8only
+default_md          = sha256
+
+[ req_distinguished_name ]
+countryName             = Country Name (2 letter code)
+organizationName        = Organization Name
+commonName              = Common Name
+
+# -----------------------------------------------------------------------------
+# End-entity profile: server
+# -----------------------------------------------------------------------------
+[ server_cert ]
+basicConstraints        = critical, CA:false
+keyUsage                = critical, digitalSignature
+extendedKeyUsage        = serverAuth
+subjectKeyIdentifier    = hash
+authorityKeyIdentifier  = keyid, issuer
+authorityInfoAccess     = OCSP;URI:http://127.0.0.1:2560, caIssuers;URI:http://127.0.0.1:8080/intermediate.crt
+crlDistributionPoints   = URI:http://127.0.0.1:8080/intermediate.crl
+
+# -----------------------------------------------------------------------------
+# End-entity profile: client
+# -----------------------------------------------------------------------------
+[ client_cert ]
+basicConstraints        = critical, CA:false
+keyUsage                = critical, digitalSignature
+extendedKeyUsage        = clientAuth
+subjectKeyIdentifier    = hash
+authorityKeyIdentifier  = keyid, issuer
+authorityInfoAccess     = OCSP;URI:http://127.0.0.1:2560, caIssuers;URI:http://127.0.0.1:8080/intermediate.crt
+crlDistributionPoints   = URI:http://127.0.0.1:8080/intermediate.crl
+
+# -----------------------------------------------------------------------------
+# End-entity profile: code signing
+# -----------------------------------------------------------------------------
+[ codesign_cert ]
+basicConstraints        = critical, CA:false
+keyUsage                = critical, digitalSignature
+extendedKeyUsage        = codeSigning
+subjectKeyIdentifier    = hash
+authorityKeyIdentifier  = keyid, issuer
+authorityInfoAccess     = OCSP;URI:http://127.0.0.1:2560, caIssuers;URI:http://127.0.0.1:8080/intermediate.crt
+crlDistributionPoints   = URI:http://127.0.0.1:8080/intermediate.crl
+
+# -----------------------------------------------------------------------------
+# OCSP responder certificate (dedicated signing certificate)
+# -----------------------------------------------------------------------------
+[ ocsp_cert ]
+basicConstraints        = CA:false
+extendedKeyUsage        = OCSPSigning
+
+# -----------------------------------------------------------------------------
+# CRL extensions
+# -----------------------------------------------------------------------------
+[ crl_ext ]
+authorityKeyIdentifier  = keyid:always

@@ -1,0 +1,571 @@
+#!/usr/bin/env bash
+# =============================================================================
+# pki-tool - Two-tier PKI management (wrapper around OpenSSL)
+#
+# Passphrases are NEVER passed on the command line. The root key passphrase is
+# read from a file or from an environment variable:
+#     PKI_ROOT_PASS_FILE=/path/to/file   -> openssl -passin file:/path/to/file
+#     PKI_ROOT_PASS=...                  -> openssl -passin env:PKI_ROOT_PASS
+#
+# =============================================================================
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Git Bash (MSYS) on Windows rewrites arguments starting with "/" into Windows
+# paths. Exclude those arguments from the conversion. Has no effect on Linux/macOS.
+export MSYS2_ARG_CONV_EXCL="${MSYS2_ARG_CONV_EXCL:+$MSYS2_ARG_CONV_EXCL;}/O="
+
+ROOT_CNF="$SCRIPT_DIR/config/openssl-root.cnf"
+INT_CNF="$SCRIPT_DIR/config/openssl-intermediate.cnf"
+
+# --- Parameters  -------------------------------------------
+ROOT_KEY_BITS=4096
+ROOT_DAYS=7300          # 20 years
+INT_DAYS=1825           # 5 years
+ROOT_SUBJECT="/O=Lab PKI/CN=Lab Root CA"
+INT_SUBJECT="/O=Lab PKI/CN=Lab Intermediate CA"
+
+# --- Helpers ------------------------------------------------------------------
+log() { printf '[pki-tool] %s\n' "$*"; }
+die() { printf '[pki-tool] ERROR: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+Usage: pki-tool [--pki-dir <dir>] <command> [options]
+
+Commands:
+  init-root           Generate the root key (encrypted) and self-signed root
+                      certificate, initialise the root CA database.
+  init-intermediate   Generate the intermediate key and CSR, then have the
+                      root sign it.
+  issue --profile <server|client|codesign> --cn <name> [--san <list>]
+                      Generate a key and CSR, sign with the intermediate.
+  renew --serial <serial>
+                      Issue a new certificate for the same subject.
+  revoke --serial <serial> [--reason <reason>]
+                      Mark a certificate as revoked.
+  gen-crl [--root]    Generate the intermediate (or root) CRL.
+  gen-ocsp-cert       Issue the dedicated OCSP signing certificate.
+  list                List issued certificates and their status.
+  verify <cert>       Verify a certificate against the chain and CRLs.
+
+Environment:
+  PKI_DIR             Base directory of the PKI (default: <script dir>/pki)
+  PKI_ROOT_PASS_FILE  File containing the root key passphrase
+  PKI_ROOT_PASS       Root key passphrase (used if no file is given)
+EOF
+}
+
+check_prerequisites() {
+  command -v openssl >/dev/null 2>&1 || die "openssl not found"
+  local version
+  version="$(openssl version | awk '{print $2}')"
+  [[ "${version%%.*}" -ge 3 ]] || die "OpenSSL 3.x required (found $version)"
+  [[ -f "$ROOT_CNF" ]] || die "missing config: $ROOT_CNF"
+  [[ -f "$INT_CNF" ]] || die "missing config: $INT_CNF"
+}
+
+setup_paths() {
+  PKI_DIR="${1:-${PKI_DIR:-$SCRIPT_DIR/pki}}"
+  mkdir -p "$PKI_DIR"
+  PKI_DIR="$(cd "$PKI_DIR" && pwd)"
+  export PKI_DIR          # read by the OpenSSL configs ($ENV::PKI_DIR)
+
+  ROOT_DIR="$PKI_DIR/root"
+  INT_DIR="$PKI_DIR/intermediate"
+  CHAIN_FILE="$PKI_DIR/ca-chain.crt"
+  CRL_CHAIN="$PKI_DIR/crl-chain.pem"   # intermediate CRL + root CRL
+}
+
+# Prints the OpenSSL -passin/-pass argument for the root key passphrase.
+root_pass_arg() {
+  if [[ -n "${PKI_ROOT_PASS_FILE:-}" ]]; then
+    [[ -r "$PKI_ROOT_PASS_FILE" ]] || die "cannot read PKI_ROOT_PASS_FILE: $PKI_ROOT_PASS_FILE"
+    printf 'file:%s' "$PKI_ROOT_PASS_FILE"
+  elif [[ -n "${PKI_ROOT_PASS:-}" ]]; then
+    export PKI_ROOT_PASS
+    printf 'env:PKI_ROOT_PASS'
+  else
+    die "root passphrase not set: define PKI_ROOT_PASS_FILE or PKI_ROOT_PASS"
+  fi
+}
+
+# Creates the directory structure and database files of a CA.
+init_ca_dirs() {
+  local dir="$1"
+  mkdir -p "$dir/private" "$dir/newcerts" "$dir/crl"
+  chmod 700 "$dir/private"
+  : > "$dir/index.txt"
+  printf 'unique_subject = no\n' > "$dir/index.txt.attr"
+  printf '01\n' > "$dir/crlnumber"
+  printf '01\n' > "$dir/serial"   # never used: certificates get random serials (-rand_serial)
+}
+
+# --- Commands -----------------------------------------------------------------
+cmd_init_root() {
+  [[ $# -eq 0 ]] || die "init-root takes no arguments"
+  [[ ! -e "$ROOT_DIR/private/root.key" ]] || die "root CA already exists in $ROOT_DIR"
+
+  local pass
+  pass="$(root_pass_arg)"
+
+  log "Initialising root CA in $ROOT_DIR"
+  init_ca_dirs "$ROOT_DIR"
+
+  log "Generating root key (RSA $ROOT_KEY_BITS, AES-256 encrypted)"
+  openssl genpkey -algorithm RSA \
+    -pkeyopt "rsa_keygen_bits:$ROOT_KEY_BITS" \
+    -aes256 -pass "$pass" \
+    -out "$ROOT_DIR/private/root.key"
+  chmod 400 "$ROOT_DIR/private/root.key"
+
+  log "Creating self-signed root certificate ($ROOT_DAYS days)"
+  openssl req -config "$ROOT_CNF" -new -x509 \
+    -key "$ROOT_DIR/private/root.key" -passin "$pass" \
+    -days "$ROOT_DAYS" -extensions v3_root_ca \
+    -subj "$ROOT_SUBJECT" \
+    -out "$ROOT_DIR/root.crt"
+  chmod 444 "$ROOT_DIR/root.crt"
+
+  log "Root CA ready: $ROOT_DIR/root.crt"
+}
+
+cmd_init_intermediate() {
+  [[ $# -eq 0 ]] || die "init-intermediate takes no arguments"
+  [[ -f "$ROOT_DIR/root.crt" && -f "$ROOT_DIR/private/root.key" ]] \
+    || die "root CA not found: run init-root first"
+  [[ ! -e "$INT_DIR/private/intermediate.key" ]] \
+    || die "intermediate CA already exists in $INT_DIR"
+
+  local pass
+  pass="$(root_pass_arg)"
+
+  log "Initialising intermediate CA in $INT_DIR"
+  init_ca_dirs "$INT_DIR"
+  mkdir -p "$INT_DIR/csr"
+
+  log "Generating intermediate key (ECDSA P-384)"
+  openssl genpkey -algorithm EC \
+    -pkeyopt ec_paramgen_curve:P-384 \
+    -pkeyopt ec_param_enc:named_curve \
+    -out "$INT_DIR/private/intermediate.key"
+  chmod 400 "$INT_DIR/private/intermediate.key"
+
+  log "Creating intermediate CSR"
+  openssl req -config "$INT_CNF" -new \
+    -key "$INT_DIR/private/intermediate.key" \
+    -subj "$INT_SUBJECT" \
+    -out "$INT_DIR/csr/intermediate.csr"
+
+  log "Root signs the intermediate certificate ($INT_DAYS days)"
+  openssl ca -config "$ROOT_CNF" -batch -notext -rand_serial \
+    -extensions v3_intermediate_ca -days "$INT_DAYS" \
+    -passin "$pass" \
+    -in "$INT_DIR/csr/intermediate.csr" \
+    -out "$INT_DIR/intermediate.crt"
+  chmod 444 "$INT_DIR/intermediate.crt"
+
+  log "Building CA chain: $CHAIN_FILE"
+  cat "$INT_DIR/intermediate.crt" "$ROOT_DIR/root.crt" > "$CHAIN_FILE"
+
+  log "Verifying intermediate against root"
+  openssl verify -CAfile "$ROOT_DIR/root.crt" "$INT_DIR/intermediate.crt"
+
+  log "Intermediate CA ready: $INT_DIR/intermediate.crt"
+}
+
+# --- Leaf certificate helpers -------------------------------------------------
+require_intermediate() {
+  [[ -f "$INT_DIR/intermediate.crt" && -f "$INT_DIR/private/intermediate.key" ]] \
+    || die "intermediate CA not found: run init-root and init-intermediate first"
+}
+
+# Generates an ECDSA P-256 key for an end-entity certificate.
+new_leaf_key() {
+  openssl genpkey -algorithm EC \
+    -pkeyopt ec_paramgen_curve:P-256 \
+    -pkeyopt ec_param_enc:named_curve \
+    -out "$1"
+  chmod 400 "$1"
+}
+
+# Checks a comma-separated SAN list: DNS:<name>, IP:<addr>, email:<addr>
+validate_san() {
+  local san="$1" item
+  local -a items
+  IFS=',' read -r -a items <<< "$san"
+  [[ ${#items[@]} -gt 0 ]] || die "empty SAN list"
+  for item in "${items[@]}"; do
+    [[ "$item" =~ ^(DNS|IP|email):[^[:space:],]+$ ]] \
+      || die "invalid SAN entry '$item' (expected DNS:<name>, IP:<addr> or email:<addr>)"
+  done
+}
+
+# sign_leaf <extensions-section> <subject> <key> <csr> <crt> [san]
+# Creates a CSR (SAN, if any, is placed in the CSR) and has the intermediate
+# sign it with the given profile section.
+sign_leaf() {
+  local section="$1" subject="$2" key="$3" csr="$4" crt="$5" san="${6:-}"
+  local -a addext=()
+  if [[ -n "$san" ]]; then
+    addext=(-addext "subjectAltName=$san")
+  fi
+
+  openssl req -config "$INT_CNF" -new \
+    -key "$key" \
+    -subj "$subject" \
+    ${addext[@]+"${addext[@]}"} \
+    -out "$csr"
+
+  openssl ca -config "$INT_CNF" -batch -notext -rand_serial \
+    -extensions "$section" \
+    -in "$csr" \
+    -out "$crt"
+  chmod 444 "$crt"
+}
+
+cert_serial() {
+  openssl x509 -in "$1" -noout -serial | cut -d= -f2
+}
+
+cmd_issue() {
+  local profile="" cn="" san=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --profile)
+        [[ $# -ge 2 ]] || die "--profile requires a value"
+        profile="$2"; shift 2 ;;
+      --cn)
+        [[ $# -ge 2 ]] || die "--cn requires a value"
+        cn="$2"; shift 2 ;;
+      --san)
+        [[ $# -ge 2 ]] || die "--san requires a value"
+        san="$2"; shift 2 ;;
+      *)
+        die "issue: unknown argument: $1" ;;
+    esac
+  done
+
+  [[ -n "$profile" ]] || die "issue: --profile is required (server, client or codesign)"
+  [[ -n "$cn" ]] || die "issue: --cn is required"
+  [[ "$cn" =~ ^[A-Za-z0-9][A-Za-z0-9._@-]*$ ]] \
+    || die "issue: invalid --cn '$cn' (allowed: letters, digits, . _ @ -)"
+
+  local out_dir
+  case "$profile" in
+    server)   out_dir="$PKI_DIR/servers" ;;
+    client)   out_dir="$PKI_DIR/clients" ;;
+    codesign) out_dir="$PKI_DIR/codesign" ;;
+    *)        die "issue: unknown profile '$profile' (server, client or codesign)" ;;
+  esac
+
+  if [[ "$profile" == "server" && -z "$san" ]]; then
+    die "issue: server certificates require --san (e.g. DNS:web.lab.local,IP:127.0.0.1)"
+  fi
+  if [[ -n "$san" ]]; then
+    validate_san "$san"
+  fi
+
+  require_intermediate
+  [[ ! -e "$out_dir/$cn.key" && ! -e "$out_dir/$cn.crt" ]] \
+    || die "a $profile certificate for '$cn' already exists in $out_dir (use renew)"
+
+  mkdir -p "$out_dir"
+
+  log "Issuing $profile certificate for '$cn'"
+  new_leaf_key "$out_dir/$cn.key"
+  sign_leaf "${profile}_cert" "/O=Lab PKI/CN=$cn" \
+    "$out_dir/$cn.key" "$INT_DIR/csr/$profile-$cn.csr" "$out_dir/$cn.crt" "$san"
+
+  log "Certificate: $out_dir/$cn.crt (serial $(cert_serial "$out_dir/$cn.crt"))"
+  log "Private key: $out_dir/$cn.key"
+}
+
+cmd_gen_ocsp_cert() {
+  [[ $# -eq 0 ]] || die "gen-ocsp-cert takes no arguments"
+  require_intermediate
+
+  local out_dir="$PKI_DIR/ocsp"
+  [[ ! -e "$out_dir/ocsp.key" && ! -e "$out_dir/ocsp.crt" ]] \
+    || die "OCSP signing certificate already exists in $out_dir"
+
+  mkdir -p "$out_dir"
+
+  log "Issuing OCSP signing certificate"
+  new_leaf_key "$out_dir/ocsp.key"
+  sign_leaf "ocsp_cert" "/O=Lab PKI/CN=Lab OCSP Responder" \
+    "$out_dir/ocsp.key" "$INT_DIR/csr/ocsp.csr" "$out_dir/ocsp.crt"
+
+  log "Certificate: $out_dir/ocsp.crt (serial $(cert_serial "$out_dir/ocsp.crt"))"
+  log "Private key: $out_dir/ocsp.key"
+}
+
+# --- Revocation, CRL, renewal, listing, verification --------------------------
+# Validates a hexadecimal serial and prints it in upper case.
+normalize_serial() {
+  [[ "$1" =~ ^[0-9A-Fa-f]+$ ]] || die "invalid serial '$1' (hexadecimal expected)"
+  printf '%s' "$1" | tr 'a-f' 'A-F'
+}
+
+# Prints the status letter (V, R, E) of a serial in the intermediate database.
+serial_status() {
+  awk -F'\t' -v s="$1" '$4 == s { print $1 }' "$INT_DIR/index.txt"
+}
+
+cert_cn() {
+  openssl x509 -in "$1" -noout -subject -nameopt RFC2253 \
+    | sed -n 's/.*CN=\([^,]*\).*/\1/p'
+}
+
+cert_profile() {
+  local eku
+  eku="$(openssl x509 -in "$1" -noout -ext extendedKeyUsage 2>/dev/null || true)"
+  case "$eku" in
+    *"TLS Web Server"*) printf 'server' ;;
+    *"TLS Web Client"*) printf 'client' ;;
+    *"Code Signing"*)   printf 'codesign' ;;
+    *"OCSP Signing"*)   printf 'ocsp' ;;
+    *)                  die "cannot determine the profile of $1" ;;
+  esac
+}
+
+# Prints the SAN of a certificate in the format accepted by --san (or nothing).
+cert_san() {
+  { openssl x509 -in "$1" -noout -ext subjectAltName 2>/dev/null || true; } \
+    | tail -n +2 \
+    | sed -e 's/^ *//' -e 's/IP Address:/IP:/g' -e 's/, */,/g'
+}
+
+# Rebuilds crl-chain.pem (intermediate CRL + root CRL) from the CRLs that exist.
+rebuild_crl_chain() {
+  local tmp="$CRL_CHAIN.tmp" f
+  : > "$tmp"
+  for f in "$INT_DIR/crl/intermediate.crl" "$ROOT_DIR/crl/root.crl"; do
+    if [[ -f "$f" ]]; then
+      cat "$f" >> "$tmp"
+    fi
+  done
+  mv "$tmp" "$CRL_CHAIN"
+}
+
+cmd_revoke() {
+  local serial="" reason=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --serial)
+        [[ $# -ge 2 ]] || die "--serial requires a value"
+        serial="$2"; shift 2 ;;
+      --reason)
+        [[ $# -ge 2 ]] || die "--reason requires a value"
+        reason="$2"; shift 2 ;;
+      *)
+        die "revoke: unknown argument: $1" ;;
+    esac
+  done
+
+  [[ -n "$serial" ]] || die "revoke: --serial is required"
+  serial="$(normalize_serial "$serial")"
+
+  if [[ -n "$reason" ]]; then
+    case "$reason" in
+      unspecified|keyCompromise|CACompromise|affiliationChanged|superseded|cessationOfOperation|certificateHold) ;;
+      *) die "revoke: invalid reason '$reason' (unspecified, keyCompromise, CACompromise, affiliationChanged, superseded, cessationOfOperation, certificateHold)" ;;
+    esac
+  fi
+
+  require_intermediate
+
+  local cert="$INT_DIR/newcerts/$serial.pem" status
+  [[ -f "$cert" ]] || die "revoke: no certificate with serial $serial was issued by the intermediate"
+  status="$(serial_status "$serial")"
+  [[ "$status" != "R" ]] || die "revoke: certificate $serial is already revoked"
+
+  log "Revoking certificate $serial${reason:+ (reason: $reason)}"
+  if [[ -n "$reason" ]]; then
+    openssl ca -config "$INT_CNF" -revoke "$cert" -crl_reason "$reason"
+  else
+    openssl ca -config "$INT_CNF" -revoke "$cert"
+  fi
+  log "Revoked in the CA database. Run 'gen-crl' to publish the new CRL."
+}
+
+cmd_gen_crl() {
+  local root=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --root) root=1; shift ;;
+      *)      die "gen-crl: unknown argument: $1" ;;
+    esac
+  done
+
+  local crl
+  if [[ "$root" -eq 1 ]]; then
+    [[ -f "$ROOT_DIR/root.crt" && -f "$ROOT_DIR/private/root.key" ]] \
+      || die "root CA not found: run init-root first"
+    local pass
+    pass="$(root_pass_arg)"
+    crl="$ROOT_DIR/crl/root.crl"
+    log "Generating root CRL"
+    openssl ca -config "$ROOT_CNF" -gencrl -passin "$pass" -out "$crl"
+  else
+    require_intermediate
+    crl="$INT_DIR/crl/intermediate.crl"
+    log "Generating intermediate CRL"
+    openssl ca -config "$INT_CNF" -gencrl -out "$crl"
+  fi
+
+  rebuild_crl_chain
+  log "CRL: $crl"
+  log "$(openssl crl -in "$crl" -noout -nextupdate)"
+  log "CRL chain: $CRL_CHAIN"
+}
+
+cmd_renew() {
+  local serial=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --serial)
+        [[ $# -ge 2 ]] || die "--serial requires a value"
+        serial="$2"; shift 2 ;;
+      *)
+        die "renew: unknown argument: $1" ;;
+    esac
+  done
+
+  [[ -n "$serial" ]] || die "renew: --serial is required"
+  serial="$(normalize_serial "$serial")"
+  require_intermediate
+
+  local old="$INT_DIR/newcerts/$serial.pem"
+  [[ -f "$old" ]] || die "renew: no certificate with serial $serial was issued by the intermediate"
+
+  local cn profile san
+  cn="$(cert_cn "$old")"
+  profile="$(cert_profile "$old")"
+  san="$(cert_san "$old")"
+  [[ -n "$cn" ]] || die "renew: cannot read the subject of $old"
+
+  local out_dir name section csr
+  case "$profile" in
+    server)   out_dir="$PKI_DIR/servers";  name="$cn";  section="server_cert";   csr="$INT_DIR/csr/server-$cn.csr" ;;
+    client)   out_dir="$PKI_DIR/clients";  name="$cn";  section="client_cert";   csr="$INT_DIR/csr/client-$cn.csr" ;;
+    codesign) out_dir="$PKI_DIR/codesign"; name="$cn";  section="codesign_cert"; csr="$INT_DIR/csr/codesign-$cn.csr" ;;
+    ocsp)     out_dir="$PKI_DIR/ocsp";     name="ocsp"; section="ocsp_cert";     csr="$INT_DIR/csr/ocsp.csr" ;;
+  esac
+
+  mkdir -p "$out_dir"
+
+  log "Renewing $profile certificate '$cn' (old serial $serial)"
+  # Build the new key and certificate under temporary names first, so that the
+  # current files stay untouched if anything fails.
+  new_leaf_key "$out_dir/$name.key.new"
+  sign_leaf "$section" "/O=Lab PKI/CN=$cn" \
+    "$out_dir/$name.key.new" "$csr" "$out_dir/$name.crt.new" "$san"
+
+  if [[ -f "$out_dir/$name.crt" ]]; then
+    local current
+    current="$(cert_serial "$out_dir/$name.crt")"
+    mkdir -p "$out_dir/archive"
+    mv "$out_dir/$name.crt" "$out_dir/archive/$name-$current.crt"
+    if [[ -f "$out_dir/$name.key" ]]; then
+      mv "$out_dir/$name.key" "$out_dir/archive/$name-$current.key"
+    fi
+  fi
+  mv "$out_dir/$name.key.new" "$out_dir/$name.key"
+  mv "$out_dir/$name.crt.new" "$out_dir/$name.crt"
+
+  log "New certificate: $out_dir/$name.crt (serial $(cert_serial "$out_dir/$name.crt"))"
+  log "The old certificate $serial stays valid until it expires or is revoked."
+}
+
+cmd_list() {
+  [[ $# -eq 0 ]] || die "list takes no arguments"
+  require_intermediate
+
+  awk -F'\t' -v now="$(date -u +%y%m%d%H%M%SZ)" '
+    function day(t) { return "20" substr(t,1,2) "-" substr(t,3,2) "-" substr(t,5,2) }
+    BEGIN { printf "%-8s %-42s %-11s %s\n", "STATUS", "SERIAL", "EXPIRES", "SUBJECT" }
+    {
+      st = "valid"
+      if ($1 == "R") { st = "revoked" }
+      else if ($2 < now) { st = "expired" }
+      line = sprintf("%-8s %-42s %-11s %s", st, $4, day($2), $6)
+      if ($1 == "R") {
+        n = split($3, r, ",")
+        line = line "  [revoked " day(r[1]) (n > 1 ? ", " r[2] : "") "]"
+      }
+      print line
+    }' "$INT_DIR/index.txt"
+}
+
+cmd_verify() {
+  [[ $# -eq 1 ]] || die "usage: pki-tool verify <cert>"
+  local cert="$1"
+  [[ -f "$cert" ]] || die "verify: file not found: $cert"
+  [[ -f "$CHAIN_FILE" ]] || die "verify: CA chain not found: run init-root and init-intermediate first"
+  [[ -f "$INT_DIR/crl/intermediate.crl" && -f "$ROOT_DIR/crl/root.crl" ]] \
+    || die "verify: CRLs missing: run 'gen-crl' and 'gen-crl --root' first"
+
+  openssl verify -crl_check_all -CAfile "$CHAIN_FILE" -CRLfile "$CRL_CHAIN" "$cert"
+}
+
+# --- Main ---------------------------------------------------------------------
+main() {
+  local pki_dir_arg=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --pki-dir)
+        [[ $# -ge 2 ]] || die "--pki-dir requires a value"
+        pki_dir_arg="$2"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        die "unknown option: $1"
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  if [[ $# -lt 1 ]]; then
+    usage >&2
+    exit 1
+  fi
+
+  local cmd="$1"
+  shift
+
+  check_prerequisites
+  setup_paths "$pki_dir_arg"
+
+  case "$cmd" in
+    init-root)          cmd_init_root "$@" ;;
+    init-intermediate)  cmd_init_intermediate "$@" ;;
+    issue)              cmd_issue "$@" ;;
+    gen-ocsp-cert)      cmd_gen_ocsp_cert "$@" ;;
+    renew)              cmd_renew "$@" ;;
+    revoke)             cmd_revoke "$@" ;;
+    gen-crl)            cmd_gen_crl "$@" ;;
+    list)               cmd_list "$@" ;;
+    verify)             cmd_verify "$@" ;;
+    help)               usage ;;
+    *)                  die "unknown command: $cmd (try --help)" ;;
+  esac
+}
+
+main "$@"

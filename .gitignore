@@ -1,0 +1,9 @@
+# Private keys: never committed
+*.key
+private/
+
+# Secret PEM files
+*.pem
+
+# Generated PKI data (keys, certificates, CA databases, CRLs)
+pki/
